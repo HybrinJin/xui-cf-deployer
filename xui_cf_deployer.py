@@ -14,6 +14,7 @@ from urllib import error, parse, request
 
 DB_PATH = "/etc/x-ui/x-ui.db"
 STATE_PATH = "/etc/x-ui/cf_auto_state.json"
+LAST_LINKS_PATH = os.path.join(os.getcwd(), "cf_auto_last_links.txt")
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
 PORT_MIN = 10000
 PORT_MAX = 60000
@@ -331,7 +332,9 @@ def parse_mode(raw: str) -> str:
         return "install"
     if text in ("2", "uninstall", "u", "卸载"):
         return "uninstall"
-    exit_error("无效模式，仅支持 1(安装) 或 2(卸载)")
+    if text in ("3", "show", "view", "v", "查看"):
+        return "show"
+    exit_error("无效模式，仅支持 1(安装) / 2(卸载) / 3(查看上次订阅)")
 
 
 def get_inbounds_schema(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -539,6 +542,51 @@ def remove_last_state() -> None:
         exit_error(f"删除上次配置记录失败: {e}")
 
 
+def save_last_links_snapshot(domain: str, user_uuid: str, links: Dict[str, str], order: List[str]) -> None:
+    lines = [
+        "上次生成订阅",
+        f"域名: {domain}",
+        f"UUID: {user_uuid}",
+        "",
+    ]
+    for protocol in order:
+        link = links.get(protocol)
+        if link:
+            lines.append(f"{PROTOCOL_LABEL[protocol]}订阅 {link}")
+    lines.append("")
+    content = "\n".join(lines)
+    try:
+        with open(LAST_LINKS_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(LAST_LINKS_PATH, 0o600)
+    except OSError as e:
+        exit_error(f"保存上次订阅失败: {e}")
+
+
+def print_last_links() -> None:
+    if os.path.exists(LAST_LINKS_PATH):
+        try:
+            with open(LAST_LINKS_PATH, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except OSError as e:
+            exit_error(f"读取上次订阅失败: {e}")
+        if content:
+            print(content)
+            return
+
+    state = load_last_state()
+    if not state:
+        exit_error("未找到可查看的上次订阅")
+    links = state.get("links")
+    if not isinstance(links, dict):
+        exit_error("未找到可查看的上次订阅")
+    order = state.get("selected_protocols") or PROTOCOL_ORDER
+    for protocol in order:
+        p = str(protocol).lower()
+        if p in links:
+            print(f"{PROTOCOL_LABEL.get(p, p.upper())}订阅 {links[p]}")
+
+
 def restore_dns_record(
     zone_id: str,
     domain: str,
@@ -614,8 +662,12 @@ def uninstall_last_config(state: Dict[str, Any], headers: Dict[str, str]) -> Non
 
 
 def main() -> None:
-    mode = parse_mode(input("模式(1=安装,2=卸载，回车=安装): "))
+    mode = parse_mode(input("模式(1=安装,2=卸载,3=查看上次订阅，回车=安装): "))
     last_state = load_last_state()
+
+    if mode == "show":
+        print_last_links()
+        return
 
     if mode == "uninstall":
         if last_state is None:
@@ -692,6 +744,9 @@ def main() -> None:
     set_ssl_mode(zone_id, headers, "flexible")
     apply_origin_rules(zone_id, headers, routes)
 
+    links = build_links(user_uuid, domain, routes)
+    save_last_links_snapshot(domain=domain, user_uuid=user_uuid, links=links, order=selected_protocols)
+
     save_last_state(
         {
             "version": 1,
@@ -709,11 +764,13 @@ def main() -> None:
             },
             "ssl_backup": ssl_before,
             "origin_rules_backup": origin_rules_before,
+            "links": links,
+            "selected_protocols": selected_protocols,
         }
     )
 
-    links = build_links(user_uuid, domain, routes)
     print("成功")
+    print(f"已保存订阅到 {LAST_LINKS_PATH}")
     for protocol in selected_protocols:
         print(f"{PROTOCOL_LABEL[protocol]}订阅 {links[protocol]}")
 
